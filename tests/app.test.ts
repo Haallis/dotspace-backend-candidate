@@ -100,6 +100,52 @@ describe('registration API', () => {
     expect(await Registration.count()).toBe(1);
   });
 
+  it('does not exceed capacity under concurrent requests', async () => {
+    const responses = await Promise.all(
+      Array.from({ length: 25 }, (_, index) =>
+        request(app)
+          .post(`/events/${SEED_EVENT_IDS.main}/registrations`)
+          .send({ userId: seedUserId(index + 1) }),
+      ),
+    );
+
+    expect(responses.filter(({ status }) => status === 201)).toHaveLength(10);
+    expect(responses.filter(({ status }) => status === 409)).toHaveLength(15);
+    expect(responses.every(({ status }) => status < 500)).toBe(true);
+    expect(
+      responses
+        .filter(({ status }) => status === 409)
+        .every(({ body }) => body.error.code === 'EVENT_FULL'),
+    ).toBe(true);
+    expect(
+      await Registration.count({ where: { eventId: SEED_EVENT_IDS.main } }),
+    ).toBe(10);
+  });
+
+  it('returns one registration for concurrent retries', async () => {
+    const responses = await Promise.all(
+      Array.from({ length: 10 }, () =>
+        request(app)
+          .post(`/events/${SEED_EVENT_IDS.main}/registrations`)
+          .send({ userId: seedUserId(1) }),
+      ),
+    );
+
+    expect(responses.filter(({ status }) => status === 201)).toHaveLength(1);
+    expect(responses.filter(({ status }) => status === 200)).toHaveLength(9);
+    expect(responses.every(({ status }) => status < 500)).toBe(true);
+
+    const registrationIds = new Set(
+      responses.map(({ body }) => body.registration.id),
+    );
+    expect(registrationIds.size).toBe(1);
+    expect(
+      await Registration.count({
+        where: { eventId: SEED_EVENT_IDS.main, userId: seedUserId(1) },
+      }),
+    ).toBe(1);
+  });
+
   it('rejects a new participant when an event is full', async () => {
     const first = await request(app)
       .post(`/events/${SEED_EVENT_IDS.singleSeat}/registrations`)
@@ -112,6 +158,29 @@ describe('registration API', () => {
     expect(second.status).toBe(409);
     expect(second.body.error.code).toBe('EVENT_FULL');
     expect(await Registration.count()).toBe(1);
+  });
+
+  it('returns an existing registration when the event is full', async () => {
+    const first = await request(app)
+      .post(`/events/${SEED_EVENT_IDS.singleSeat}/registrations`)
+      .send({ userId: seedUserId(1) });
+    const retry = await request(app)
+      .post(`/events/${SEED_EVENT_IDS.singleSeat}/registrations`)
+      .send({ userId: seedUserId(1) });
+    const anotherUser = await request(app)
+      .post(`/events/${SEED_EVENT_IDS.singleSeat}/registrations`)
+      .send({ userId: seedUserId(2) });
+
+    expect(first.status).toBe(201);
+    expect(retry.status).toBe(200);
+    expect(retry.body.registration.id).toBe(first.body.registration.id);
+    expect(anotherUser.status).toBe(409);
+    expect(anotherUser.body.error.code).toBe('EVENT_FULL');
+    expect(
+      await Registration.count({
+        where: { eventId: SEED_EVENT_IDS.singleSeat },
+      }),
+    ).toBe(1);
   });
 
   it('returns 404 for an unknown event', async () => {
